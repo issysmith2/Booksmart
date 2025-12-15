@@ -1,2 +1,84 @@
 # Booksmart
 A smart booking web application built using HTML, CSS, and JavaScript. Designed to solve a real-world problem for small businesses by simplifying appointment booking and schedule management. Created as a solo development project.
+const express = require('express');
+const path = require('path');
+const Database = require('better-sqlite3');
+const twilio = require('twilio');
+
+const DB_FILE = process.env.DB_FILE || 'data.db';
+const REMINDER_HOURS = Number(process.env.REMINDER_HOURS || 24);
+const PORT = process.env.PORT || 3000;
+
+const db = new Database(DB_FILE);
+db.exec(`CREATE TABLE IF NOT EXISTS bookings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_name TEXT,
+    phone TEXT,
+    service_type TEXT,
+    start_time TEXT,
+    duration_minutes INTEGER,
+    reminder_sent INTEGER DEFAULT 0,
+    created_at TEXT
+)`);
+
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/bookings', (req, res) => {
+    const rows = db.prepare('SELECT * FROM bookings ORDER BY start_time').all();
+    res.json(rows);
+});
+
+app.post('/api/bookings', (req, res) => {
+    const { customer_name, phone, service_type, start_time, duration_minutes } = req.body;
+    if (!customer_name || !phone || !start_time) {
+        return res.status(400).json({ error: 'customer_name, phone and start_time are required' });
+    }
+    const stmt = db.prepare('INSERT INTO bookings (customer_name, phone, service_type, start_time, duration_minutes, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const info = stmt.run(customer_name, phone, service_type || 'service', start_time, duration_minutes || 60, new Date().toISOString());
+    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(info.lastInsertRowid);
+    res.status(201).json(booking);
+});
+
+app.put('/api/bookings/:id', (req, res) => {
+    const { id } = req.params;
+    const { customer_name, phone, service_type, start_time, duration_minutes } = req.body;
+    db.prepare('UPDATE bookings SET customer_name = ?, phone = ?, service_type = ?, start_time = ?, duration_minutes = ? WHERE id = ?')
+        .run(customer_name, phone, service_type, start_time, duration_minutes, id);
+    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(id);
+    res.json(booking);
+});
+
+app.delete('/api/bookings/:id', (req, res) => {
+    const { id } = req.params;
+    db.prepare('DELETE FROM bookings WHERE id = ?').run(id);
+    res.status(204).end();
+});
+
+let twilioClient = null;
+if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM) {
+    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+}
+
+function sendSms(to, body) {
+    if (twilioClient) {
+        return twilioClient.messages.create({ from: process.env.TWILIO_FROM, to, body });
+    } else {
+        console.log('SMS (simulated) to', to, ':', body);
+        return Promise.resolve({ sid: 'SIMULATED' });
+    }
+}
+
+function checkAndSendReminders() {
+    const now = new Date();
+    const windowStart = new Date(now.getTime() + (REMINDER_HOURS * 3600 - 60) * 1000);
+    const windowEnd = new Date(now.getTime() + (REMINDER_HOURS * 3600 + 60) * 1000);
+    const rows = db.prepare('SELECT * FROM bookings WHERE reminder_sent = 0').all();
+    rows.forEach(booking => {
+        const start = new Date(booking.start_time);
+        if (start >= windowStart && start <= windowEnd) {
+            const msg = `Reminder: Hi ${booking.customer_name}, your ${booking.service_type} is scheduled at ${start.toLocaleString()}. Reply or call if you need to reschedule.`;
+            sendSms(booking.phone, msg).then(() => {
+                db.prepare('UPDATE bookings SET reminder_sent = 1 WHERE id = ?').run(booking.id);
+                console.log('Reminder sent for booking', booking.id);
